@@ -94,6 +94,9 @@ public class BleObdManager {
         pumpQueue();
     }
 
+    private static final long RESPONSE_TIMEOUT_MS = 2000;
+    private final Runnable responseTimeoutRunnable = this::onResponseTimeout;
+
     private void pumpQueue() {
         if (waitingForResponse || gatt == null || writeChar == null) return;
         String next = commandQueue.poll();
@@ -101,6 +104,17 @@ public class BleObdManager {
         pendingCommand = next;
         waitingForResponse = true;
         writeRaw(next + "\r");
+        mainHandler.removeCallbacks(responseTimeoutRunnable);
+        mainHandler.postDelayed(responseTimeoutRunnable, RESPONSE_TIMEOUT_MS);
+    }
+
+    /** A BLE write can silently get dropped by the stack; don't stall the queue forever. */
+    private void onResponseTimeout() {
+        if (!waitingForResponse) return;
+        waitingForResponse = false;
+        pendingCommand = null;
+        rxBuffer.setLength(0);
+        pumpQueue();
     }
 
     @RequiresPermission(android.Manifest.permission.BLUETOOTH_CONNECT)
@@ -141,8 +155,19 @@ public class BleObdManager {
                         "Не найден serial-сервис адаптера. Возможно, это другая модель ELM327."));
                 return;
             }
-            enableNotifications(g, notifyChar);
-            mainHandler.post(listener::onConnected);
+            // onConnected() fires from onDescriptorWrite() below once notifications are
+            // actually enabled - the adapter refuses a second GATT op (the first command
+            // write) while the descriptor write from enableNotifications() is still pending.
+            if (!enableNotifications(g, notifyChar)) {
+                mainHandler.post(listener::onConnected);
+            }
+        }
+
+        @Override
+        public void onDescriptorWrite(BluetoothGatt g, BluetoothGattDescriptor descriptor, int status) {
+            if (CLIENT_CONFIG_DESCRIPTOR.equals(descriptor.getUuid())) {
+                mainHandler.post(listener::onConnected);
+            }
         }
 
         @Override
@@ -192,18 +217,19 @@ public class BleObdManager {
         }
     }
 
+    /** @return true if a descriptor write was issued (caller must wait for onDescriptorWrite). */
     @RequiresPermission(android.Manifest.permission.BLUETOOTH_CONNECT)
-    private void enableNotifications(BluetoothGatt g, BluetoothGattCharacteristic characteristic) {
+    private boolean enableNotifications(BluetoothGatt g, BluetoothGattCharacteristic characteristic) {
         g.setCharacteristicNotification(characteristic, true);
         BluetoothGattDescriptor descriptor = characteristic.getDescriptor(CLIENT_CONFIG_DESCRIPTOR);
-        if (descriptor != null) {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                g.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-            } else {
-                descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
-                g.writeDescriptor(descriptor);
-            }
+        if (descriptor == null) return false;
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            g.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+        } else {
+            descriptor.setValue(BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE);
+            g.writeDescriptor(descriptor);
         }
+        return true;
     }
 
     /**
@@ -231,6 +257,7 @@ public class BleObdManager {
             rxBuffer.setLength(0);
             waitingForResponse = false;
             pendingCommand = null;
+            mainHandler.removeCallbacks(responseTimeoutRunnable);
             mainHandler.postDelayed(this::pumpQueue, 40);
         }
     }
