@@ -25,14 +25,19 @@ import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.content.ContextCompat;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 public class MainActivity extends AppCompatActivity {
 
-    // Cycle through these PIDs while connected - the common dashboard set.
-    private static final String[] POLL_PIDS = {"010C", "010D", "0105", "0104", "0111", "012F", "010F"};
+    // The dashboard PIDs this app knows how to display, without the "01" mode
+    // prefix. Which of them are actually polled is decided at runtime from
+    // the car's own support bitmasks.
+    private static final String[] APP_PIDS = {"0C", "0D", "05", "04", "11", "2F", "0F"};
     private static final long POLL_INTERVAL_MS = 300;
 
     private BluetoothAdapter bluetoothAdapter;
@@ -41,9 +46,19 @@ public class MainActivity extends AppCompatActivity {
     private int pollIndex = 0;
     private boolean connected = false;
 
+    private final Set<String> supportedPids = new LinkedHashSet<>();
+    private final List<String> activePollPids = new ArrayList<>();
+    private boolean discoveringPids = false;
+    /** CAN replies carry an extra code-count byte; assume CAN until ATDPN says otherwise. */
+    private boolean canProtocol = true;
+    private boolean readingDtc = false;
+    private final List<String> storedDtc = new ArrayList<>();
+    private final List<String> pendingDtc = new ArrayList<>();
+
     private TextView statusText;
     private View statusDot;
     private Button connectButton;
+    private Button dtcButton;
     private GaugeView rpmGauge;
     private GaugeView speedGauge;
     private TextView logView;
@@ -74,6 +89,7 @@ public class MainActivity extends AppCompatActivity {
         statusText = findViewById(R.id.statusText);
         statusDot = findViewById(R.id.statusDot);
         connectButton = findViewById(R.id.connectButton);
+        dtcButton = findViewById(R.id.dtcButton);
         rpmGauge = findViewById(R.id.rpmGauge);
         speedGauge = findViewById(R.id.speedGauge);
         logView = findViewById(R.id.logView);
@@ -102,6 +118,8 @@ public class MainActivity extends AppCompatActivity {
                 requestPermissionsAndScan();
             }
         });
+
+        dtcButton.setOnClickListener(v -> readDtc());
     }
 
     // ---------- permissions & scanning ----------
@@ -222,6 +240,18 @@ public class MainActivity extends AppCompatActivity {
         }
 
         @Override
+        public void onResponseComplete(String command, List<String> lines) {
+            if (command == null) return;
+            if (command.equals("ATDPN")) {
+                readProtocolNumber(lines);
+            } else if (discoveringPids && isSupportCommand(command)) {
+                handleSupportReply(command, lines);
+            } else if (readingDtc && (command.equals("03") || command.equals("07"))) {
+                handleDtcReply(command, lines);
+            }
+        }
+
+        @Override
         public void onError(String message) {
             appendLog("Ошибка: " + message);
         }
@@ -236,12 +266,95 @@ public class MainActivity extends AppCompatActivity {
         obdManager.sendCommand("ATH0");  // headers off
         obdManager.sendCommand("ATSP0"); // auto protocol detect
 
+        supportedPids.clear();
+        activePollPids.clear();
+        discoveringPids = true;
+        obdManager.sendCommand(ObdParser.SUPPORT_PIDS[0]);
+
         pollHandler.postDelayed(() -> {
             setConnectedUi(true);
-            appendLog("Готово, опрашиваем параметры двигателя");
+            appendLog("Определяем, какие параметры поддерживает машина...");
             pollIndex = 0;
             pollHandler.post(pollRunnable);
         }, 1200);
+    }
+
+    /** ATDPN answers with the protocol number, optionally prefixed by 'A' for auto. */
+    private void readProtocolNumber(List<String> lines) {
+        for (String line : lines) {
+            String cleaned = line.replace(" ", "").trim().toUpperCase();
+            if (cleaned.isEmpty() || cleaned.equals("OK")) continue;
+            char last = cleaned.charAt(cleaned.length() - 1);
+            int number = Character.digit(last, 16);
+            if (number < 0) continue;
+            // Protocols 6 and up are the CAN family (ISO 15765 / J1939).
+            canProtocol = number >= 6;
+            appendLog("Протокол: " + cleaned + (canProtocol ? " (CAN)" : " (не CAN)"));
+            return;
+        }
+    }
+
+    private boolean isSupportCommand(String command) {
+        for (String supportPid : ObdParser.SUPPORT_PIDS) {
+            if (supportPid.equals(command)) return true;
+        }
+        return false;
+    }
+
+    private void handleSupportReply(String command, List<String> lines) {
+        Set<String> found = null;
+        for (String line : lines) {
+            Set<String> parsed = ObdParser.parseSupportedPids(line);
+            if (parsed != null) {
+                found = parsed;
+                break;
+            }
+        }
+        if (found != null) supportedPids.addAll(found);
+
+        int rangeIndex = -1;
+        for (int i = 0; i < ObdParser.SUPPORT_PIDS.length; i++) {
+            if (ObdParser.SUPPORT_PIDS[i].equals(command)) rangeIndex = i;
+        }
+        // The last bit of each bitmask tells whether the next range exists.
+        String nextRangePid = String.format("%02X", (rangeIndex + 1) * 0x20);
+        boolean hasNextRange = found != null && found.contains(nextRangePid)
+                && rangeIndex + 1 < ObdParser.SUPPORT_PIDS.length;
+        if (hasNextRange) {
+            obdManager.sendCommand(ObdParser.SUPPORT_PIDS[rangeIndex + 1]);
+        } else {
+            finishPidDiscovery();
+        }
+    }
+
+    private void finishPidDiscovery() {
+        discoveringPids = false;
+        activePollPids.clear();
+        if (supportedPids.isEmpty()) {
+            // Adapter or car didn't answer the bitmask - fall back to asking
+            // for everything and let unsupported PIDs return NO DATA.
+            activePollPids.addAll(Arrays.asList(APP_PIDS));
+            appendLog("Список поддерживаемых параметров получить не удалось, опрашиваем все");
+        } else {
+            for (String pid : APP_PIDS) {
+                if (supportedPids.contains(pid)) activePollPids.add(pid);
+            }
+            appendLog("Машина поддерживает " + supportedPids.size()
+                    + " параметров, показываем " + activePollPids.size());
+        }
+        applyRowVisibility();
+        dtcButton.setEnabled(true);
+        pollIndex = 0;
+    }
+
+    /** Hide the rows this car can't answer instead of leaving them at "--". */
+    private void applyRowVisibility() {
+        boolean knowSupport = !supportedPids.isEmpty();
+        coolantRow.setVisible(!knowSupport || supportedPids.contains("05"));
+        loadRow.setVisible(!knowSupport || supportedPids.contains("04"));
+        throttleRow.setVisible(!knowSupport || supportedPids.contains("11"));
+        fuelRow.setVisible(!knowSupport || supportedPids.contains("2F"));
+        intakeRow.setVisible(!knowSupport || supportedPids.contains("0F"));
     }
 
     private final Runnable pollRunnable = new Runnable() {
@@ -251,20 +364,81 @@ public class MainActivity extends AppCompatActivity {
             // Only ask for the next PID once the adapter has answered the
             // previous one - a fixed-rate poller would otherwise pile up
             // requests behind a slow protocol search.
-            if (obdManager.isIdle()) {
-                String pid = POLL_PIDS[pollIndex % POLL_PIDS.length];
+            if (!discoveringPids && !readingDtc && !activePollPids.isEmpty() && obdManager.isIdle()) {
+                String pid = activePollPids.get(pollIndex % activePollPids.size());
                 pollIndex++;
-                obdManager.sendCommand(pid);
+                obdManager.sendCommand("01" + pid);
             }
             pollHandler.postDelayed(this, POLL_INTERVAL_MS);
         }
     };
+
+    // ---------- trouble codes ----------
+
+    private void readDtc() {
+        if (!connected || readingDtc) return;
+        readingDtc = true;
+        dtcButton.setEnabled(false);
+        storedDtc.clear();
+        pendingDtc.clear();
+        appendLog("Запрашиваем коды ошибок...");
+        // ATDPN only reports a real protocol once one has been negotiated, so
+        // ask here rather than during init - and ahead of 03/07, whose replies
+        // are decoded differently on CAN.
+        obdManager.sendCommand("ATDPN");
+        obdManager.sendCommand("03"); // stored codes
+        obdManager.sendCommand("07"); // pending codes
+    }
+
+    private void handleDtcReply(String command, List<String> lines) {
+        if (command.equals("03")) {
+            storedDtc.addAll(DtcDecoder.decode(lines, 0x43, canProtocol));
+            return;
+        }
+        pendingDtc.addAll(DtcDecoder.decode(lines, 0x47, canProtocol));
+        readingDtc = false;
+        dtcButton.setEnabled(true);
+        showDtcDialog();
+    }
+
+    private void showDtcDialog() {
+        if (isFinishing() || isDestroyed()) return;
+        StringBuilder message = new StringBuilder();
+        if (storedDtc.isEmpty() && pendingDtc.isEmpty()) {
+            message.append("Ошибок не найдено.\n\nЕсли лампа Check Engine горит, "
+                    + "код может быть в блоке, который не отвечает по стандартным режимам.");
+        } else {
+            appendCodes(message, "Сохранённые ошибки", storedDtc);
+            appendCodes(message, "Ожидающие подтверждения", pendingDtc);
+        }
+        new AlertDialog.Builder(this)
+                .setTitle("Коды ошибок")
+                .setMessage(message.toString().trim())
+                .setPositiveButton("Закрыть", null)
+                .show();
+    }
+
+    private void appendCodes(StringBuilder message, String title, List<String> codes) {
+        if (codes.isEmpty()) return;
+        message.append(title).append(":\n");
+        for (String code : codes) {
+            message.append("• ").append(code).append(" — ")
+                    .append(DtcDecoder.describe(code)).append('\n');
+            appendLog("DTC " + code + ": " + DtcDecoder.describe(code));
+        }
+        message.append('\n');
+    }
 
     private void setConnectedUi(boolean isConnected) {
         connected = isConnected;
         statusText.setText(isConnected ? "Подключено" : "Не подключено");
         statusDot.setBackgroundResource(isConnected ? R.drawable.dot_green : R.drawable.dot_red);
         connectButton.setText(isConnected ? "Отключить" : "Подключить");
+        if (!isConnected) {
+            dtcButton.setEnabled(false);
+            readingDtc = false;
+            discoveringPids = false;
+        }
     }
 
     // ---------- data handling ----------
@@ -317,6 +491,7 @@ public class MainActivity extends AppCompatActivity {
 
     /** Small helper bundling the three views of one stat_row.xml include. */
     private static class RowViews {
+        final View root;
         final TextView valueView;
         final ProgressBar progressView;
         final String unit;
@@ -324,10 +499,15 @@ public class MainActivity extends AppCompatActivity {
 
         RowViews(View root, String label, String unit, int maxForBar) {
             ((TextView) root.findViewById(R.id.rowLabel)).setText(label);
+            this.root = root;
             this.valueView = root.findViewById(R.id.rowValue);
             this.progressView = root.findViewById(R.id.rowProgress);
             this.unit = unit;
             this.maxForBar = maxForBar;
+        }
+
+        void setVisible(boolean visible) {
+            root.setVisibility(visible ? View.VISIBLE : View.GONE);
         }
 
         void update(double value) {

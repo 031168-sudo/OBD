@@ -16,6 +16,7 @@ import android.util.Log;
 import androidx.annotation.RequiresPermission;
 
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -39,6 +40,8 @@ public class BleObdManager {
         void onConnected();
         void onDisconnected();
         void onLine(String line);          // one parsed response line from the adapter
+        /** Every line of one command's reply, once the '>' prompt closed it. */
+        void onResponseComplete(String command, List<String> lines);
         void onError(String message);
     }
 
@@ -141,9 +144,13 @@ public class BleObdManager {
     /** A BLE write can silently get dropped by the stack; don't stall the queue forever. */
     private void onResponseTimeout() {
         if (!waitingForResponse) return;
+        String abandonedCommand = pendingCommand;
         waitingForResponse = false;
         pendingCommand = null;
         rxBuffer.setLength(0);
+        // Report the empty reply too: a caller waiting on this command to
+        // finish a multi-step sequence would otherwise wait forever.
+        listener.onResponseComplete(abandonedCommand, new ArrayList<>());
         pumpQueue();
     }
 
@@ -279,6 +286,7 @@ public class BleObdManager {
         rxBuffer.append(chunk);
         String content = rxBuffer.toString();
         if (content.indexOf('>') >= 0) {
+            List<String> responseLines = new ArrayList<>();
             String[] frames = content.split(">");
             for (String frame : frames) {
                 String cleaned = frame.replace("\r", "\n").trim();
@@ -287,15 +295,18 @@ public class BleObdManager {
                         String trimmed = line.trim();
                         if (!trimmed.isEmpty() && !trimmed.equalsIgnoreCase(pendingCommand)) {
                             String finalLine = trimmed;
+                            responseLines.add(finalLine);
                             mainHandler.post(() -> listener.onLine(finalLine));
                         }
                     }
                 }
             }
+            String answeredCommand = pendingCommand;
             rxBuffer.setLength(0);
             waitingForResponse = false;
             pendingCommand = null;
             mainHandler.removeCallbacks(responseTimeoutRunnable);
+            mainHandler.post(() -> listener.onResponseComplete(answeredCommand, responseLines));
             mainHandler.postDelayed(this::pumpQueue, 40);
         }
     }
