@@ -32,7 +32,7 @@ import java.util.Map;
 public class MainActivity extends AppCompatActivity {
 
     // Cycle through these PIDs while connected - the common dashboard set.
-    private static final String[] POLL_PIDS = {"010C", "010D", "0105", "0104", "0111", "012F"};
+    private static final String[] POLL_PIDS = {"010C", "010D", "0105", "0104", "0111", "012F", "010F"};
     private static final long POLL_INTERVAL_MS = 300;
 
     private BluetoothAdapter bluetoothAdapter;
@@ -248,9 +248,14 @@ public class MainActivity extends AppCompatActivity {
         @Override
         public void run() {
             if (!connected) return;
-            String pid = POLL_PIDS[pollIndex % POLL_PIDS.length];
-            pollIndex++;
-            obdManager.sendCommand(pid);
+            // Only ask for the next PID once the adapter has answered the
+            // previous one - a fixed-rate poller would otherwise pile up
+            // requests behind a slow protocol search.
+            if (obdManager.isIdle()) {
+                String pid = POLL_PIDS[pollIndex % POLL_PIDS.length];
+                pollIndex++;
+                obdManager.sendCommand(pid);
+            }
             pollHandler.postDelayed(this, POLL_INTERVAL_MS);
         }
     };

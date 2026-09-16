@@ -76,6 +76,7 @@ public class BleObdManager {
 
     @RequiresPermission(allOf = {android.Manifest.permission.BLUETOOTH_CONNECT})
     public void connect(BluetoothDevice device) {
+        resetState();
         gatt = device.connectGatt(context, false, gattCallback);
     }
 
@@ -86,16 +87,32 @@ public class BleObdManager {
             gatt.close();
             gatt = null;
         }
+        resetState();
     }
 
-    private static final int MAX_QUEUED_COMMANDS = 2;
+    /**
+     * Characteristics belong to the closed BluetoothGatt and the in-flight
+     * flags describe a connection that no longer exists, so a reconnect
+     * that inherits them would never send anything: pumpQueue() bails out
+     * while waitingForResponse is still set from the old session.
+     */
+    private void resetState() {
+        mainHandler.removeCallbacks(responseTimeoutRunnable);
+        writeChar = null;
+        notifyChar = null;
+        waitingForResponse = false;
+        pendingCommand = null;
+        commandQueue.clear();
+        rxBuffer.setLength(0);
+    }
+
+    /** True when nothing is queued or in flight - the caller may poll again. */
+    public boolean isIdle() {
+        return !waitingForResponse && commandQueue.isEmpty();
+    }
 
     /** Queue an AT/OBD command; it is sent as soon as the adapter is free. */
     public void sendCommand(String command) {
-        // Don't let the queue pile up while a slow protocol search is in
-        // progress - the caller polls on a fixed timer regardless of
-        // whether earlier commands have finished.
-        if (commandQueue.size() >= MAX_QUEUED_COMMANDS) return;
         commandQueue.add(command);
         pumpQueue();
     }
@@ -151,6 +168,14 @@ public class BleObdManager {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 g.discoverServices();
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                // Android only allows a limited number of open GATT clients,
+                // so a link the adapter dropped on its own has to be closed
+                // here or repeated reconnects eventually stop working.
+                g.close();
+                if (g == gatt) {
+                    gatt = null;
+                    mainHandler.post(BleObdManager.this::resetState);
+                }
                 mainHandler.post(listener::onDisconnected);
             }
         }
