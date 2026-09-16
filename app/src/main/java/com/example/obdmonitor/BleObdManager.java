@@ -88,13 +88,26 @@ public class BleObdManager {
         }
     }
 
+    private static final int MAX_QUEUED_COMMANDS = 2;
+
     /** Queue an AT/OBD command; it is sent as soon as the adapter is free. */
     public void sendCommand(String command) {
+        // Don't let the queue pile up while a slow protocol search is in
+        // progress - the caller polls on a fixed timer regardless of
+        // whether earlier commands have finished.
+        if (commandQueue.size() >= MAX_QUEUED_COMMANDS) return;
         commandQueue.add(command);
         pumpQueue();
     }
 
-    private static final long RESPONSE_TIMEOUT_MS = 2000;
+    // ELM327 auto protocol search (ATSP0) can legitimately take several
+    // seconds when the vehicle isn't responding (ignition off, no ECU on
+    // the bus) - a short timeout here would otherwise interrupt a search
+    // that was still in progress, which makes the adapter abort it with
+    // "STOPPED" and immediately start searching again for the next queued
+    // command, looping forever instead of ever reporting the real result
+    // ("UNABLE TO CONNECT"/"NO DATA").
+    private static final long RESPONSE_TIMEOUT_MS = 10000;
     private final Runnable responseTimeoutRunnable = this::onResponseTimeout;
 
     private void pumpQueue() {
