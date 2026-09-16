@@ -42,7 +42,9 @@ public class MainActivity extends AppCompatActivity {
     // prefix. Which of them are actually polled is decided at runtime from
     // the car's own support bitmasks.
     private static final String[] APP_PIDS = {"0C", "0D", "05", "04", "11", "2F", "0F"};
-    private static final long POLL_INTERVAL_MS = 300;
+    /** Support bitmasks are static plumbing, not measurements - never logged. */
+    private static final String[] BITMASK_PIDS = {"20", "40", "60", "80", "A0", "C0"};
+    private static final long POLL_INTERVAL_MS = 80;
 
     private BluetoothAdapter bluetoothAdapter;
     private BleObdManager obdManager;
@@ -51,7 +53,13 @@ public class MainActivity extends AppCompatActivity {
     private boolean connected = false;
 
     private final Set<String> supportedPids = new LinkedHashSet<>();
-    private final List<String> activePollPids = new ArrayList<>();
+    /** What the dashboard shows, polled twice as often as the rest. */
+    private final List<String> screenPids = new ArrayList<>();
+    /** Everything the car supports - the log records all of it. */
+    private final List<String> logPids = new ArrayList<>();
+    private TripLogger tripLogger;
+    private int logIndex = 0;
+    private boolean screenTurn = true;
     private boolean discoveringPids = false;
     /** CAN replies carry an extra code-count byte; assume CAN until ATDPN says otherwise. */
     private boolean canProtocol = true;
@@ -151,7 +159,7 @@ public class MainActivity extends AppCompatActivity {
         }
         StringBuilder message = new StringBuilder();
         for (String pid : supportedPids) {
-            boolean shown = activePollPids.contains(pid);
+            boolean shown = screenPids.contains(pid);
             message.append(shown ? "● " : "○ ")
                     .append(pid).append(" — ").append(PidCatalog.name(pid)).append('\n');
         }
@@ -177,7 +185,7 @@ public class MainActivity extends AppCompatActivity {
         report.append("Запрос — это режим 01 плюс номер параметра, например 010C.\n");
         report.append("[+] отмечены те, что приложение сейчас выводит на экран.\n\n");
         for (String pid : supportedPids) {
-            report.append(activePollPids.contains(pid) ? "[+] " : "[ ] ")
+            report.append(screenPids.contains(pid) ? "[+] " : "[ ] ")
                     .append("01").append(pid).append("  ")
                     .append(PidCatalog.name(pid)).append('\n');
         }
@@ -310,6 +318,8 @@ public class MainActivity extends AppCompatActivity {
                 handleSupportReply(command, lines);
             } else if (readingDtc && (command.equals("03") || command.equals("07"))) {
                 handleDtcReply(command, lines);
+            } else if (command.length() == 4 && command.startsWith("01")) {
+                recordForLog(command, lines);
             }
         }
 
@@ -329,7 +339,8 @@ public class MainActivity extends AppCompatActivity {
         obdManager.sendCommand("ATSP0"); // auto protocol detect
 
         supportedPids.clear();
-        activePollPids.clear();
+        screenPids.clear();
+        logPids.clear();
         discoveringPids = true;
         obdManager.sendCommand(ObdParser.SUPPORT_PIDS[0]);
 
@@ -392,23 +403,73 @@ public class MainActivity extends AppCompatActivity {
 
     private void finishPidDiscovery() {
         discoveringPids = false;
-        activePollPids.clear();
+        screenPids.clear();
+        logPids.clear();
         if (supportedPids.isEmpty()) {
             // Adapter or car didn't answer the bitmask - fall back to asking
             // for everything and let unsupported PIDs return NO DATA.
-            activePollPids.addAll(Arrays.asList(APP_PIDS));
+            screenPids.addAll(Arrays.asList(APP_PIDS));
+            logPids.addAll(Arrays.asList(APP_PIDS));
             appendLog("Список поддерживаемых параметров получить не удалось, опрашиваем все");
         } else {
             for (String pid : APP_PIDS) {
-                if (supportedPids.contains(pid)) activePollPids.add(pid);
+                if (supportedPids.contains(pid)) screenPids.add(pid);
+            }
+            for (String pid : supportedPids) {
+                if (!Arrays.asList(BITMASK_PIDS).contains(pid)) logPids.add(pid);
             }
             appendLog("Машина поддерживает " + supportedPids.size()
-                    + " параметров, показываем " + activePollPids.size());
+                    + " параметров, показываем " + screenPids.size()
+                    + ", пишем в лог " + logPids.size());
         }
         applyRowVisibility();
         dtcButton.setEnabled(true);
         pidListButton.setEnabled(!supportedPids.isEmpty());
         pollIndex = 0;
+        logIndex = 0;
+        startTripLog();
+    }
+
+    // ---------- trip log ----------
+
+    /** One file per connection, started as soon as the PID list is known. */
+    private void startTripLog() {
+        stopTripLog();
+        if (logPids.isEmpty()) return;
+        tripLogger = new TripLogger(this, new ArrayList<>(logPids));
+        try {
+            appendLog("Пишем лог: " + tripLogger.start(lastProtocol));
+        } catch (IOException e) {
+            appendLog("Лог не создан: " + e.getMessage());
+            tripLogger = null;
+        }
+    }
+
+    private void stopTripLog() {
+        if (tripLogger == null) return;
+        if (tripLogger.isRunning()) {
+            tripLogger.stop();
+            appendLog("Лог закрыт: " + tripLogger.location()
+                    + ", строк: " + tripLogger.rowCount());
+        }
+        tripLogger = null;
+    }
+
+    private void recordForLog(String command, List<String> lines) {
+        if (tripLogger == null || !tripLogger.isRunning()) return;
+        String pid = command.substring(2);
+        for (String line : lines) {
+            String hex = ObdParser.normalize(line);
+            if (!hex.startsWith("41") || hex.length() < 4) continue;
+            if (!hex.substring(2, 4).equals(pid)) continue;
+            tripLogger.record(pid, ObdParser.decode(pid, ObdParser.dataBytes(hex)),
+                    ObdParser.rawPayload(hex));
+            break;
+        }
+        // A round is complete once the last logged PID has answered.
+        if (!logPids.isEmpty() && pid.equals(logPids.get(logPids.size() - 1))) {
+            tripLogger.endRound();
+        }
     }
 
     /** Hide the rows this car can't answer instead of leaving them at "--". */
@@ -428,14 +489,30 @@ public class MainActivity extends AppCompatActivity {
             // Only ask for the next PID once the adapter has answered the
             // previous one - a fixed-rate poller would otherwise pile up
             // requests behind a slow protocol search.
-            if (!discoveringPids && !readingDtc && !activePollPids.isEmpty() && obdManager.isIdle()) {
-                String pid = activePollPids.get(pollIndex % activePollPids.size());
-                pollIndex++;
-                obdManager.sendCommand("01" + pid);
+            if (!discoveringPids && !readingDtc && obdManager.isIdle()) {
+                String pid = nextPid();
+                if (pid != null) obdManager.sendCommand("01" + pid);
             }
             pollHandler.postDelayed(this, POLL_INTERVAL_MS);
         }
     };
+
+    /**
+     * Alternates between the dashboard PIDs and the full logged set, so the
+     * gauges keep updating at roughly twice the rate of a log round instead
+     * of waiting for all 40 parameters to come round again.
+     */
+    private String nextPid() {
+        if (logPids.isEmpty()) {
+            if (screenPids.isEmpty()) return null;
+            return screenPids.get(pollIndex++ % screenPids.size());
+        }
+        screenTurn = !screenTurn;
+        if (screenTurn && !screenPids.isEmpty()) {
+            return screenPids.get(pollIndex++ % screenPids.size());
+        }
+        return logPids.get(logIndex++ % logPids.size());
+    }
 
     // ---------- trouble codes ----------
 
@@ -499,6 +576,7 @@ public class MainActivity extends AppCompatActivity {
         statusDot.setBackgroundResource(isConnected ? R.drawable.dot_green : R.drawable.dot_red);
         connectButton.setText(isConnected ? "Отключить" : "Подключить");
         if (!isConnected) {
+            stopTripLog();
             dtcButton.setEnabled(false);
             readingDtc = false;
             discoveringPids = false;
@@ -550,6 +628,7 @@ public class MainActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+        stopTripLog();
         pollHandler.removeCallbacksAndMessages(null);
         try {
             if (obdManager != null) obdManager.disconnect();
