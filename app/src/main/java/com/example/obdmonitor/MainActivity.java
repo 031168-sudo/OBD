@@ -15,6 +15,7 @@ import android.os.Looper;
 import android.text.format.DateFormat;
 import android.text.method.ScrollingMovementMethod;
 import android.view.View;
+import android.view.WindowManager;
 import android.widget.Button;
 import android.widget.ProgressBar;
 import android.widget.TextView;
@@ -572,6 +573,13 @@ public class MainActivity extends AppCompatActivity {
 
     private void setConnectedUi(boolean isConnected) {
         connected = isConnected;
+        // Polling and logging only run while this screen is in front, so don't
+        // let the display time out mid-drive and cut the recording short.
+        if (isConnected) {
+            getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        } else {
+            getWindow().clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+        }
         statusText.setText(isConnected ? "Подключено" : "Не подключено");
         statusDot.setBackgroundResource(isConnected ? R.drawable.dot_green : R.drawable.dot_red);
         connectButton.setText(isConnected ? "Отключить" : "Подключить");
