@@ -35,22 +35,25 @@ public class DtcDecoder {
      *                     protocols don't, and it must not be read as a code
      */
     public static List<String> decode(List<String> lines, int responseByte, boolean canProtocol) {
-        String payload = joinPayload(lines);
+        List<String> codes = new ArrayList<>();
         String marker = String.format("%02X", responseByte);
-        int start = payload.indexOf(marker);
-        if (start < 0) return new ArrayList<>();
-        payload = payload.substring(start + 2);
+        for (String reply : splitReplies(lines)) {
+            decodeReply(reply, marker, canProtocol, codes);
+        }
+        return codes;
+    }
 
+    private static void decodeReply(String reply, String marker, boolean canProtocol, List<String> codes) {
+        if (!reply.startsWith(marker)) return;
+        String payload = reply.substring(2);
         if (canProtocol && payload.length() >= 2) {
             payload = payload.substring(2); // number of codes, not a code
         }
 
-        List<String> codes = new ArrayList<>();
         for (int i = 0; i + 4 <= payload.length(); i += 4) {
-            String raw = payload.substring(i, i + 4);
             int value;
             try {
-                value = Integer.parseInt(raw, 16);
+                value = Integer.parseInt(payload.substring(i, i + 4), 16);
             } catch (NumberFormatException e) {
                 continue;
             }
@@ -60,16 +63,21 @@ public class DtcDecoder {
             String code = String.format("%c%d%03X", letter, firstDigit, value & 0x0FFF);
             if (!codes.contains(code)) codes.add(code);
         }
-        return codes;
     }
 
     /**
-     * Strips the framing the adapter adds around multi-frame replies: an
-     * ISO-TP length header on its own line and a "0:"/"1:" index in front
-     * of each frame.
+     * Splits the reply lines into independent replies.
+     *
+     * Several control units can answer one request, each with its own
+     * "43"/"47" header, so the lines must not be concatenated blindly:
+     * a second unit's header would then be read as a trouble code (43 00
+     * decodes as "C0300"). Only the frames of one multi-frame ISO-TP reply
+     * belong together - those carry a "0:"/"1:" index and are preceded by a
+     * length header on its own line.
      */
-    private static String joinPayload(List<String> lines) {
-        StringBuilder joined = new StringBuilder();
+    private static List<String> splitReplies(List<String> lines) {
+        List<String> replies = new ArrayList<>();
+        StringBuilder multiFrame = null;
         for (String line : lines) {
             String cleaned = line.replace(" ", "").trim().toUpperCase();
             if (cleaned.isEmpty()) continue;
@@ -78,12 +86,22 @@ public class DtcDecoder {
                     || cleaned.contains("STOPPED") || cleaned.equals("OK")) {
                 continue;
             }
-            int colon = cleaned.indexOf(':');
-            if (colon == 1) cleaned = cleaned.substring(2);
-            else if (cleaned.length() == 3) continue; // bare ISO-TP length header
-            joined.append(cleaned);
+            if (cleaned.indexOf(':') == 1) {
+                boolean firstFrame = cleaned.charAt(0) == '0';
+                if (firstFrame || multiFrame == null) {
+                    multiFrame = new StringBuilder();
+                    replies.add(null); // placeholder, filled in below
+                }
+                multiFrame.append(cleaned.substring(2));
+                replies.set(replies.size() - 1, multiFrame.toString());
+            } else if (cleaned.length() == 3) {
+                multiFrame = null; // ISO-TP length header announces a new reply
+            } else {
+                multiFrame = null;
+                replies.add(cleaned);
+            }
         }
-        return joined.toString();
+        return replies;
     }
 
     public static String describe(String code) {
