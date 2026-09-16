@@ -10,6 +10,8 @@ on:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
       - name: Checkout
@@ -36,3 +38,12 @@ jobs:
           name: obd-monitor-debug-apk
           path: app/build/outputs/apk/debug/*.apk
           if-no-files-found: error
+
+      - name: Publish APK to release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: debug-apk-run-${{ github.run_number }}
+          name: Debug APK (run ${{ github.run_number }})
+          prerelease: true
+          files: app/build/outputs/apk/debug/*.apk
