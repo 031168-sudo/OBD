@@ -12,6 +12,7 @@ import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.format.DateFormat;
 import android.text.method.ScrollingMovementMethod;
 import android.view.View;
 import android.widget.Button;
@@ -24,6 +25,9 @@ import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.core.content.ContextCompat;
 
+import java.io.IOException;
+import java.io.OutputStream;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.LinkedHashMap;
@@ -59,6 +63,8 @@ public class MainActivity extends AppCompatActivity {
     private View statusDot;
     private Button connectButton;
     private Button dtcButton;
+    private Button pidListButton;
+    private String lastProtocol = "неизвестен";
     private GaugeView rpmGauge;
     private GaugeView speedGauge;
     private TextView logView;
@@ -90,6 +96,7 @@ public class MainActivity extends AppCompatActivity {
         statusDot = findViewById(R.id.statusDot);
         connectButton = findViewById(R.id.connectButton);
         dtcButton = findViewById(R.id.dtcButton);
+        pidListButton = findViewById(R.id.pidListButton);
         rpmGauge = findViewById(R.id.rpmGauge);
         speedGauge = findViewById(R.id.speedGauge);
         logView = findViewById(R.id.logView);
@@ -120,6 +127,61 @@ public class MainActivity extends AppCompatActivity {
         });
 
         dtcButton.setOnClickListener(v -> readDtc());
+        pidListButton.setOnClickListener(v -> showPidListDialog());
+    }
+
+    // ---------- supported parameter list ----------
+
+    private final ActivityResultLauncher<String> saveReportLauncher =
+            registerForActivityResult(new ActivityResultContracts.CreateDocument("text/plain"), uri -> {
+                if (uri == null) return;
+                try (OutputStream out = getContentResolver().openOutputStream(uri)) {
+                    if (out == null) throw new IOException("не удалось открыть файл");
+                    out.write(buildPidReport().getBytes(StandardCharsets.UTF_8));
+                    Toast.makeText(this, "Список сохранён", Toast.LENGTH_LONG).show();
+                } catch (IOException e) {
+                    Toast.makeText(this, "Не удалось сохранить: " + e.getMessage(), Toast.LENGTH_LONG).show();
+                }
+            });
+
+    private void showPidListDialog() {
+        if (supportedPids.isEmpty()) {
+            Toast.makeText(this, "Список параметров ещё не получен", Toast.LENGTH_LONG).show();
+            return;
+        }
+        StringBuilder message = new StringBuilder();
+        for (String pid : supportedPids) {
+            boolean shown = activePollPids.contains(pid);
+            message.append(shown ? "● " : "○ ")
+                    .append(pid).append(" — ").append(PidCatalog.name(pid)).append('\n');
+        }
+        message.append("\n● — выводится на экран, ○ — доступен, но не выводится");
+
+        new AlertDialog.Builder(this)
+                .setTitle("Поддерживается: " + supportedPids.size())
+                .setMessage(message.toString())
+                .setPositiveButton("Закрыть", null)
+                .setNeutralButton("Сохранить в файл",
+                        (dialog, which) -> saveReportLauncher.launch("obd-parameters.txt"))
+                .show();
+    }
+
+    private String buildPidReport() {
+        StringBuilder report = new StringBuilder();
+        report.append("OBD Monitor — параметры, поддерживаемые автомобилем\n");
+        report.append("Дата: ")
+                .append(DateFormat.format("yyyy-MM-dd HH:mm", System.currentTimeMillis()))
+                .append('\n');
+        report.append("Протокол: ").append(lastProtocol).append('\n');
+        report.append("Всего поддерживается: ").append(supportedPids.size()).append("\n\n");
+        report.append("Запрос — это режим 01 плюс номер параметра, например 010C.\n");
+        report.append("[+] отмечены те, что приложение сейчас выводит на экран.\n\n");
+        for (String pid : supportedPids) {
+            report.append(activePollPids.contains(pid) ? "[+] " : "[ ] ")
+                    .append("01").append(pid).append("  ")
+                    .append(PidCatalog.name(pid)).append('\n');
+        }
+        return report.toString();
     }
 
     // ---------- permissions & scanning ----------
@@ -289,7 +351,8 @@ public class MainActivity extends AppCompatActivity {
             if (number < 0) continue;
             // Protocols 6 and up are the CAN family (ISO 15765 / J1939).
             canProtocol = number >= 6;
-            appendLog("Протокол: " + cleaned + (canProtocol ? " (CAN)" : " (не CAN)"));
+            lastProtocol = cleaned + (canProtocol ? " (CAN)" : " (не CAN)");
+            appendLog("Протокол: " + lastProtocol);
             return;
         }
     }
@@ -344,6 +407,7 @@ public class MainActivity extends AppCompatActivity {
         }
         applyRowVisibility();
         dtcButton.setEnabled(true);
+        pidListButton.setEnabled(!supportedPids.isEmpty());
         pollIndex = 0;
     }
 
@@ -438,6 +502,9 @@ public class MainActivity extends AppCompatActivity {
             dtcButton.setEnabled(false);
             readingDtc = false;
             discoveringPids = false;
+            // The discovered list stays valid after a disconnect, so keep the
+            // report reachable; only a new connection replaces it.
+            pidListButton.setEnabled(!supportedPids.isEmpty());
         }
     }
 
