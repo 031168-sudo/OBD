@@ -12,6 +12,7 @@ import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.text.method.ScrollingMovementMethod;
 import android.view.View;
 import android.widget.Button;
 import android.widget.ProgressBar;
@@ -76,6 +77,7 @@ public class MainActivity extends AppCompatActivity {
         rpmGauge = findViewById(R.id.rpmGauge);
         speedGauge = findViewById(R.id.speedGauge);
         logView = findViewById(R.id.logView);
+        logView.setMovementMethod(new ScrollingMovementMethod());
 
         rpmGauge.setMax(8000f);
         rpmGauge.setLabelAndUnit("ОБОРОТЫ", "об/мин");
@@ -292,6 +294,11 @@ public class MainActivity extends AppCompatActivity {
 
     private void appendLog(String text) {
         logView.append(text + "\n");
+        android.text.Layout layout = logView.getLayout();
+        if (layout != null) {
+            int scrollAmount = layout.getLineTop(logView.getLineCount()) - logView.getHeight();
+            logView.scrollTo(0, Math.max(scrollAmount, 0));
+        }
     }
 
     @Override
